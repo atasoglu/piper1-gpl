@@ -4,7 +4,7 @@ import ast
 import logging
 import operator
 from functools import reduce
-from typing import Optional
+from typing import List, Optional
 
 import lightning as L
 import torch
@@ -40,6 +40,10 @@ class VitsModel(L.LightningModule):
         sample_rate: int = 22050,
         num_symbols: int = 256,
         num_speakers: int = 1,
+        # Multilingual: espeak-ng voices in language id order (linked from
+        # data.languages). More than one adds a per-phoneme language embedding
+        # to the text encoder and a "lid" input to the exported model.
+        languages: Optional[List[str]] = None,
         # audio
         resblock="2",
         resblock_kernel_sizes=(3, 5, 7),
@@ -103,6 +107,10 @@ class VitsModel(L.LightningModule):
         # when fine-tuning with use_mrd=true, since --ckpt_path does a strict
         # load that fails on the extra MRD keys. Starts a fresh optimizer.
         warmstart_ckpt: Optional[str] = None,
+        # Text encoder pretrained as a phoneme-level BERT (piper.train.plbert).
+        # Only enc_p's embeddings and transformer are loaded; its hyperparameters
+        # and languages must match this model's. Applied after warmstart_ckpt.
+        text_encoder_ckpt: Optional[str] = None,
         # Optional no-reference MOS predictor for validation audio. Set to None
         # (or "none") to disable. Logged as "val_mos" -- a perceptual-quality
         # signal that can be monitored for early stopping (mode="max").
@@ -152,6 +160,9 @@ class VitsModel(L.LightningModule):
         # Only the text/phoneme agnostic portions are loaded.
         self._vocoder_warmstart_ckpt = vocoder_warmstart_ckpt
         self._warmstart_ckpt = warmstart_ckpt
+        self._text_encoder_ckpt = text_encoder_ckpt
+
+        self.num_languages = max(1, len(self.hparams.languages or []))
 
         # Gammas resolved in configure_optimizers, re-asserted in
         # on_train_start after any checkpoint restore.
@@ -178,6 +189,7 @@ class VitsModel(L.LightningModule):
             n_speakers=self.hparams.num_speakers,
             gin_channels=self.hparams.gin_channels,
             use_sdp=self.hparams.use_sdp,
+            n_languages=self.num_languages,
         )
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
@@ -195,7 +207,7 @@ class VitsModel(L.LightningModule):
         if mos_metric and (mos_metric.lower() != "none"):
             self._mos_predictor = MosPredictor(mos_metric.lower())
 
-    def forward(self, text, text_lengths, scales, sid=None):
+    def forward(self, text, text_lengths, scales, sid=None, lid=None):
         noise_scale = scales[0]
         length_scale = scales[1]
         noise_scale_w = scales[2]
@@ -206,6 +218,7 @@ class VitsModel(L.LightningModule):
             length_scale=length_scale,
             noise_scale_w=noise_scale_w,
             sid=sid,
+            lid=lid,
         )
 
         return audio
@@ -229,7 +242,9 @@ class VitsModel(L.LightningModule):
             _x_mask,
             z_mask,
             (_z, z_p, m_p, logs_p, _m_q, logs_q),
-        ) = self.model_g(x, x_lengths, spec, spec_lengths, speaker_ids)
+        ) = self.model_g(
+            x, x_lengths, spec, spec_lengths, speaker_ids, lid=batch.language_ids
+        )
 
         # Mel/STFT must run in fp32: cuFFT does not support bf16, and a stable
         # mel L1 wants full precision anyway. Disable autocast and cast the
@@ -440,8 +455,13 @@ class VitsModel(L.LightningModule):
                 if test_utt.speaker_id is not None
                 else None
             )
+            lid = (
+                test_utt.language_ids.unsqueeze(0).to(self.device)
+                if test_utt.language_ids is not None
+                else None
+            )
             with torch.inference_mode():
-                test_audio = self(text, text_lengths, scales, sid=sid).detach()
+                test_audio = self(text, text_lengths, scales, sid=sid, lid=lid).detach()
 
             # Score perceptual quality on the raw (un-normalized) audio.
             if mos_enabled:
@@ -599,6 +619,58 @@ class VitsModel(L.LightningModule):
             skipped,
         )
 
+    def _load_text_encoder_from_ckpt(self, ckpt_path: str):
+        """Load a pretrained text encoder (piper.train.plbert) into enc_p."""
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        pretrained = ckpt["hyper_parameters"]
+
+        expected = {
+            "num_symbols": self.hparams.num_symbols,
+            "hidden_channels": self.hparams.hidden_channels,
+            "filter_channels": self.hparams.filter_channels,
+            "n_heads": self.hparams.n_heads,
+            "n_layers": self.hparams.n_layers,
+            "kernel_size": self.hparams.kernel_size,
+            "languages": list(self.hparams.languages or []),
+        }
+        for name, value in expected.items():
+            pretrained_value = pretrained.get(name)
+            if name == "languages":
+                pretrained_value = list(pretrained_value or [])
+                if len(value) <= 1 and len(pretrained_value) <= 1:
+                    # Monolingual on both sides: no language embedding
+                    continue
+
+            if pretrained_value != value:
+                raise ValueError(
+                    f"Text encoder checkpoint {ckpt_path} has {name}={pretrained_value}, "
+                    f"but this model has {name}={value}"
+                )
+
+        # The pretraining module keeps a TextEncoder under "encoder."; its proj
+        # (to the prior's mean/log-scale) is never trained there, so skip it.
+        prefix = "encoder."
+        encoder_sd = {
+            k[len(prefix) :]: v
+            for k, v in ckpt["state_dict"].items()
+            if k.startswith(prefix) and (not k.startswith(prefix + "proj."))
+        }
+        missing, unexpected = self.model_g.enc_p.load_state_dict(
+            encoder_sd, strict=False
+        )
+        missing = [k for k in missing if not k.startswith("proj.")]
+        if missing or unexpected:
+            raise ValueError(
+                f"Text encoder checkpoint {ckpt_path} does not match enc_p "
+                f"(missing: {missing}, unexpected: {unexpected})"
+            )
+
+        _LOGGER.info(
+            "[text encoder] Loaded %s pretrained parameters from %s",
+            len(encoder_sd),
+            ckpt_path,
+        )
+
     def on_fit_start(self):
         # Called once at the start of fit()
 
@@ -612,7 +684,11 @@ class VitsModel(L.LightningModule):
         # throwing away every epoch trained so far, with nothing but this log
         # line to show for it.
         resume_ckpt = getattr(self.trainer, "ckpt_path", None)
-        if resume_ckpt and (self._warmstart_ckpt or self._vocoder_warmstart_ckpt):
+        if resume_ckpt and (
+            self._warmstart_ckpt
+            or self._vocoder_warmstart_ckpt
+            or self._text_encoder_ckpt
+        ):
             _LOGGER.info(
                 "Resuming from %s; skipping the warmstart carried in its "
                 "hyperparameters",
@@ -620,6 +696,7 @@ class VitsModel(L.LightningModule):
             )
             self._warmstart_ckpt = None
             self._vocoder_warmstart_ckpt = None
+            self._text_encoder_ckpt = None
 
         if self._vocoder_warmstart_ckpt is not None:
             # Make sure we're on the correct device
@@ -629,3 +706,7 @@ class VitsModel(L.LightningModule):
         if self._warmstart_ckpt is not None:
             self._warmstart_from_ckpt(self._warmstart_ckpt)
             self._warmstart_ckpt = None
+
+        if self._text_encoder_ckpt is not None:
+            self._load_text_encoder_from_ckpt(self._text_encoder_ckpt)
+            self._text_encoder_ckpt = None

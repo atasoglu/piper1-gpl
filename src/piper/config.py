@@ -65,6 +65,20 @@ class PiperConfig:
     default_speaker_id: int = 0
     """Id of the default speaker for multi-speaker voices."""
 
+    language_id_map: Mapping[str, int] = field(default_factory=dict)
+    """espeak-ng voice -> language id (multilingual voices only).
+
+    The voice's own espeak_voice is the default language.
+    """
+
+    lexicon: Mapping[str, str] = field(default_factory=dict)
+    """Word -> espeak-ng voice for foreign words (multilingual voices only)."""
+
+    @property
+    def num_languages(self) -> int:
+        """Number of languages (1 for monolingual voices)."""
+        return max(1, len(self.language_id_map))
+
     @staticmethod
     def from_dict(config: dict[str, Any]) -> "PiperConfig":
         """Load configuration from a dictionary."""
@@ -93,6 +107,9 @@ class PiperConfig:
             ),
             #
             default_speaker_id=config.get("default_speaker_id", 0),
+            #
+            language_id_map=config.get("language_id_map", {}),
+            lexicon=config.get("lexicon", {}),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -120,6 +137,13 @@ class PiperConfig:
 
         if self.piper_version:
             config_dict["piper_version"] = self.piper_version
+
+        if self.language_id_map:
+            config_dict["num_languages"] = self.num_languages
+            config_dict["language_id_map"] = self.language_id_map
+
+        if self.lexicon:
+            config_dict["lexicon"] = self.lexicon
 
         if self.vowel_clusters:
             config_dict["vowel_clusters"] = [
@@ -150,3 +174,6 @@ class SynthesisConfig:
 
     volume: float = 1.0
     """Multiplier for audio samples (< 1 is quieter, > 1 is louder)."""
+
+    language: Optional[str] = None
+    """Language of the text (multilingual voices only; defaults to the voice's espeak voice)."""

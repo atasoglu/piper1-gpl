@@ -102,6 +102,10 @@ setup(
             "ninja>=1,<2",
             "onnx>=1,<2",  # for alignments
         ],
+        # Text encoder pretraining with --model.word_target lm
+        "plbert": [
+            "transformers>=4,<6",
+        ],
         "http": [
             "flask>=3,<4",
         ],

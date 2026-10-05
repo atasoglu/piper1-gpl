@@ -52,6 +52,11 @@ def _record_warmstarts(model, monkeypatch) -> list:
         "_warmstart_vocoder_from_ckpt",
         lambda path: called.append(("vocoder", path)),
     )
+    monkeypatch.setattr(
+        model,
+        "_load_text_encoder_from_ckpt",
+        lambda path: called.append(("text_encoder", path)),
+    )
     return called
 
 
@@ -107,3 +112,25 @@ def test_warmstart_does_not_re_run_on_a_second_fit(monkeypatch) -> None:
     model.on_fit_start()
 
     assert len(called) == 1
+
+
+def test_text_encoder_is_skipped_when_resuming(monkeypatch) -> None:
+    model = _tiny_model(text_encoder_ckpt="plbert.ckpt")
+    model._trainer = _StubTrainer(ckpt_path="run/last.ckpt")
+    called = _record_warmstarts(model, monkeypatch)
+
+    model.on_fit_start()
+
+    assert not called
+    assert model._text_encoder_ckpt is None
+
+
+def test_text_encoder_loads_after_warmstart(monkeypatch) -> None:
+    model = _tiny_model(warmstart_ckpt="base.ckpt", text_encoder_ckpt="plbert.ckpt")
+    model._trainer = _StubTrainer(ckpt_path=None)
+    called = _record_warmstarts(model, monkeypatch)
+
+    model.on_fit_start()
+    model.on_fit_start()
+
+    assert called == [("full", "base.ckpt"), ("text_encoder", "plbert.ckpt")]

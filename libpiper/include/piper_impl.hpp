@@ -77,6 +77,11 @@ struct piper_synthesizer {
   int hop_length = DEFAULT_HOP_LENGTH;
   PhonemeType phoneme_type = PhonemeType::Espeak;
 
+  // Multilingual voices take a language id per phoneme id ("lid" input).
+  // libpiper does not split text by language, so every phoneme id gets the
+  // language of espeak_voice (no code-switching). -1 for other voices.
+  int64_t default_language_id = -1;
+
   // Default synthesis settings for the voice
   float synth_length_scale = DEFAULT_LENGTH_SCALE;
   float synth_noise_scale = DEFAULT_NOISE_SCALE;

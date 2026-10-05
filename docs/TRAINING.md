@@ -174,6 +174,10 @@ When training a new model from scratch, you can significantly speed up training 
 
 Unlike `--ckpt_path`, using `--model.vocoder_warmstart_ckpt` allows you to train a model with a different number of phonemes without having to start completely from scratch.
 
+### Multilingual Voices and Text Encoder Pretraining
+
+`--data.languages` trains one voice that switches language word by word (code-switching), and `--model.text_encoder_ckpt` starts the text encoder from one pretrained on phonemized text (`python3 -m piper.train.plbert`). See [MULTILINGUAL.md](MULTILINGUAL.md).
+
 ## Exporting
 
 When your model is finished training, export it to onnx with:

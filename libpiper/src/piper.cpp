@@ -165,6 +165,16 @@ auto piper_create_with_options(const piper_create_options *options)
 
   synth->num_speakers = config["num_speakers"].get<SpeakerId>();
 
+  if (config.contains("language_id_map") &&
+      !config["language_id_map"].empty()) {
+    auto &language_id_map = config["language_id_map"];
+    synth->default_language_id = 0;
+    if (language_id_map.contains(synth->espeak_voice)) {
+      synth->default_language_id =
+          language_id_map[synth->espeak_voice].get<int64_t>();
+    }
+  }
+
   if (config.contains("inference")) {
     auto inference_value = config["inference"];
     if (inference_value.contains("noise_scale")) {
@@ -669,8 +679,20 @@ auto piper_synthesize_next(struct piper_synthesizer *synth,
         speaker_id_shape.data(), speaker_id_shape.size()));
   }
 
-  std::array<const char *, 4> input_names = {"input", "input_lengths", "scales",
-                                             "sid"};
+  std::vector<const char *> input_names = {"input", "input_lengths", "scales"};
+  if (synth->num_speakers > 1) {
+    input_names.push_back("sid");
+  }
+
+  // One language id per phoneme id (multilingual voices only)
+  std::vector<int64_t> language_ids;
+  if (synth->default_language_id >= 0) {
+    language_ids.assign(next_ids.size(), synth->default_language_id);
+    input_tensors.push_back(Ort::Value::CreateTensor<int64_t>(
+        memoryInfo, language_ids.data(), language_ids.size(),
+        phoneme_ids_shape.data(), phoneme_ids_shape.size()));
+    input_names.push_back("lid");
+  }
 
   std::vector<std::string> output_names_strs = synth->session->GetOutputNames();
   std::vector<const char *> output_names;

@@ -199,6 +199,43 @@ class PiperVoice:
             download_dir=Path(download_dir),
         )
 
+    def phonemize_with_languages(
+        self, text: str, language: Optional[str] = None
+    ) -> list[tuple[list[str], list[str]]]:
+        """
+        Text to phonemes and their languages, grouped by sentence.
+
+        Multilingual voices only. Foreign words are found with <lang>...</lang>
+        markup (e.g. <en-us>meeting</en-us>) and the voice's lexicon.
+
+        :param text: Text to phonemize.
+        :param language: Language of the text (defaults to the voice's espeak voice).
+        :return: (phonemes, languages) for each sentence.
+        """
+        if not self.config.language_id_map:
+            raise ValueError("Voice is not multilingual")
+
+        if language is None:
+            language = self.config.espeak_voice
+
+        from .phonemize_multilingual import MultilingualPhonemizer
+
+        phonemizer = getattr(self, "_multilingual_phonemizer", None)
+        if phonemizer is None:
+            phonemizer = MultilingualPhonemizer(
+                list(self.config.language_id_map),
+                lexicon=self.config.lexicon,
+                espeak_data_dir=self.espeak_data_dir,
+            )
+            setattr(self, "_multilingual_phonemizer", phonemizer)
+
+        return [
+            (sentence.phonemes, sentence.languages)
+            for sentence in phonemizer.phonemize(
+                text, language, vowel_clusters=self.config.vowel_clusters
+            )
+        ]
+
     def phonemize(self, text: str) -> list[list[str]]:
         """
         Text to phonemes grouped by sentence.
@@ -207,6 +244,9 @@ class PiperVoice:
         :return: List of phonemes for each sentence.
         """
         global _ESPEAK_PHONEMIZER
+
+        if self.config.language_id_map:
+            return [phonemes for phonemes, _ in self.phonemize_with_languages(text)]
 
         if self.config.phoneme_type == PhonemeType.TEXT:
             # Phonemes = codepoints
@@ -357,18 +397,41 @@ class PiperVoice:
         if syn_config is None:
             syn_config = _DEFAULT_SYNTHESIS_CONFIG
 
-        sentence_phonemes = self.phonemize(text)
+        sentence_languages: list[Optional[list[str]]]
+        if self.config.language_id_map:
+            sentences = self.phonemize_with_languages(text, syn_config.language)
+            sentence_phonemes = [phonemes for phonemes, _ in sentences]
+            sentence_languages = [languages for _, languages in sentences]
+        else:
+            sentence_phonemes = self.phonemize(text)
+            sentence_languages = [None] * len(sentence_phonemes)
+
         _LOGGER.debug("text=%s, phonemes=%s", text, sentence_phonemes)
 
-        for phonemes in sentence_phonemes:
+        for phonemes, languages in zip(sentence_phonemes, sentence_languages):
             if not phonemes:
                 continue
 
-            phoneme_ids = self.phonemes_to_ids(phonemes)
+            language_ids: Optional[list[int]] = None
+            if languages is not None:
+                from .phonemize_multilingual import phonemes_to_ids_with_languages
+
+                phoneme_ids, language_ids = phonemes_to_ids_with_languages(
+                    phonemes,
+                    languages,
+                    id_map=self.config.phoneme_id_map,
+                    language_id_map=self.config.language_id_map,
+                    sentence_language=syn_config.language or self.config.espeak_voice,
+                )
+            else:
+                phoneme_ids = self.phonemes_to_ids(phonemes)
 
             phoneme_id_samples: Optional[np.ndarray] = None
             audio_result = self.phoneme_ids_to_audio(
-                phoneme_ids, syn_config, include_alignments=include_alignments
+                phoneme_ids,
+                syn_config,
+                include_alignments=include_alignments,
+                language_ids=language_ids,
             )
             if isinstance(audio_result, tuple):
                 # Audio + alignments
@@ -500,6 +563,7 @@ class PiperVoice:
         phoneme_ids: list[int],
         syn_config: Optional[SynthesisConfig] = None,
         include_alignments: bool = False,
+        language_ids: Optional[list[int]] = None,
     ) -> Union[np.ndarray, Tuple[np.ndarray, Optional[np.ndarray]]]:
         """
         Synthesize raw audio from phoneme ids.
@@ -507,6 +571,8 @@ class PiperVoice:
         :param phoneme_ids: List of phoneme ids.
         :param syn_config: Synthesis configuration.
         :param include_alignments: Return samples per phoneme id if True.
+        :param language_ids: Language id per phoneme id (multilingual voices only).
+            Defaults to the language of syn_config (or the voice) for every id.
         :return: Audio float numpy array from voice model (unnormalized, in range [-1, 1]).
 
         If include_alignments is True and the voice model supports it, the return
@@ -553,6 +619,18 @@ class PiperVoice:
         if speaker_id is not None:
             sid = np.array([speaker_id], dtype=np.int64)
             args["sid"] = sid
+
+        if self.config.language_id_map:
+            if language_ids is None:
+                language = syn_config.language or self.config.espeak_voice
+                language_ids = [self.config.language_id_map[language]] * len(
+                    phoneme_ids
+                )
+
+            if len(language_ids) != len(phoneme_ids):
+                raise ValueError("Expected one language id per phoneme id")
+
+            args["lid"] = np.expand_dims(np.array(language_ids, dtype=np.int64), 0)
 
         # Synthesize through onnx
         result = self.session.run(

@@ -1,6 +1,7 @@
 """PyTorch Lightning dataset."""
 
 import csv
+import hashlib
 import itertools
 import json
 import logging
@@ -23,6 +24,11 @@ from piper.config import PhonemeType, PiperConfig
 from piper.phoneme_ids import DEFAULT_PHONEME_ID_MAP
 from piper.phoneme_ids import phonemes_to_ids as default_phonemes_to_ids
 from piper.phonemize_espeak import EspeakPhonemizer
+from piper.phonemize_multilingual import (
+    MultilingualPhonemizer,
+    normalize_word,
+    phonemes_to_ids_with_languages,
+)
 
 from .mel_processing import spectrogram_torch
 from .utils import get_cache_id
@@ -38,6 +44,7 @@ class CachedUtterance:
     audio_spec_path: Path
     text: Optional[str] = None
     speaker_id: Optional[int] = None
+    language_ids_path: Optional[Path] = None
 
 
 class DatasetType(str, Enum):
@@ -73,6 +80,8 @@ class VitsDataModule(L.LightningDataModule):
         dataset_type: Union[str, DatasetType] = DatasetType.TEXT.value,
         phonemes_path: Optional[Union[str, Path]] = None,
         vowel_clusters: Optional[str] = None,
+        languages: Optional[List[str]] = None,
+        lexicon_path: Optional[Union[str, Path]] = None,
     ) -> None:
         super().__init__()
 
@@ -137,6 +146,37 @@ class VitsDataModule(L.LightningDataModule):
         if vowel_clusters:
             self.vowel_clusters = {tuple(vc) for vc in json.loads(vowel_clusters)}
 
+        # Multilingual: espeak-ng voices, in language id order. The CSV then
+        # has a language column right before the text:
+        # utt_id|language|text or utt_id|speaker|language|text
+        self.languages: List[str] = list(languages or [])
+        self.is_multilingual = len(self.languages) > 1
+        self.lexicon: Dict[str, str] = {}
+        if lexicon_path is not None:
+            self.lexicon = load_lexicon(lexicon_path)
+
+        if self.is_multilingual:
+            if self.phoneme_type != PhonemeType.ESPEAK:
+                raise ValueError("Multilingual voices require espeak phonemes")
+
+            if self.dataset_type != DatasetType.TEXT:
+                raise ValueError("Multilingual voices require a text dataset")
+
+            if self.espeak_voice not in self.languages:
+                raise ValueError(
+                    f"espeak_voice ({self.espeak_voice}) must be one of the languages: {self.languages}"
+                )
+        elif self.lexicon:
+            raise ValueError("A lexicon requires more than one language")
+
+        # Language ids depend on the language order and the lexicon, so a
+        # change to either must not reuse cached phoneme ids.
+        self._languages_cache_key = ""
+        if self.is_multilingual:
+            self._languages_cache_key = hashlib.md5(
+                json.dumps([self.languages, self.lexicon], sort_keys=True).encode()
+            ).hexdigest()[:8]
+
     def prepare_data(self):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -175,6 +215,13 @@ class VitsDataModule(L.LightningDataModule):
             piper_version="1.5.0",
             vowel_clusters=self.vowel_clusters,
         )
+
+        if self.is_multilingual:
+            self.piper_config.language_id_map = {
+                language: language_id
+                for language_id, language in enumerate(self.languages)
+            }
+            self.piper_config.lexicon = self.lexicon
 
         if self.vowel_clusters:
             _LOGGER.info(
@@ -219,6 +266,7 @@ class VitsDataModule(L.LightningDataModule):
                 indent=2,
             )
 
+        multilingual_phonemizer: Optional[MultilingualPhonemizer] = None
         if self.phoneme_type == PhonemeType.PINYIN:
             from piper.phonemize_chinese import ChinesePhonemizer
 
@@ -271,6 +319,15 @@ class VitsDataModule(L.LightningDataModule):
             def phonemize(text: str) -> list[list[str]]:
                 return [list(unicodedata.normalize("NFD", text))]
 
+        elif self.is_multilingual:
+            # Phonemized together with language ids below
+            multilingual_phonemizer = MultilingualPhonemizer(
+                self.languages, lexicon=self.lexicon
+            )
+
+            def phonemize(text: str) -> list[list[str]]:
+                raise RuntimeError("Multilingual text needs language ids")
+
         else:
             # espeak-ng
             phonemizer = EspeakPhonemizer()
@@ -315,7 +372,8 @@ class VitsDataModule(L.LightningDataModule):
                     # utt_id|speaker_id|text
                     text = row[-1]
 
-                cache_id = get_cache_id(row_number, text, speaker_id=speaker_id)
+                language = self._row_language(row)
+                cache_id = self._cache_id(row_number, text, speaker_id, language)
 
                 # text
                 text_path = self.cache_dir / f"{cache_id}.txt"
@@ -336,6 +394,43 @@ class VitsDataModule(L.LightningDataModule):
                     phoneme_ids_path = self.cache_dir / f"{cache_id}.phonemes.pt"
                     if not phoneme_ids_path.exists():
                         torch.save(torch.LongTensor(phoneme_ids), phoneme_ids_path)
+                        if report_prepare is None:
+                            report_prepare = True
+                elif self.is_multilingual:
+                    assert language is not None
+                    assert multilingual_phonemizer is not None
+                    phoneme_ids_path = self.cache_dir / f"{cache_id}.phonemes.pt"
+                    language_ids_path = self.cache_dir / f"{cache_id}.langs.pt"
+                    if not (phoneme_ids_path.exists() and language_ids_path.exists()):
+                        # Phoneme ids and language ids come from the same pass
+                        # so they always line up.
+                        sentences = multilingual_phonemizer.phonemize(
+                            text, language, vowel_clusters=self.vowel_clusters
+                        )
+                        phonemes_path = self.cache_dir / f"{cache_id}.phonemes.txt"
+                        with open(
+                            phonemes_path, "w", encoding="utf-8"
+                        ) as phonemes_file:
+                            for sentence in sentences:
+                                print("".join(sentence.phonemes), file=phonemes_file)
+
+                        phoneme_ids = []
+                        language_ids = []
+                        for sentence in sentences:
+                            sentence_ids, sentence_lids = (
+                                phonemes_to_ids_with_languages(
+                                    sentence.phonemes,
+                                    sentence.languages,
+                                    id_map=phoneme_id_map,
+                                    language_id_map=self.piper_config.language_id_map,
+                                    sentence_language=language,
+                                )
+                            )
+                            phoneme_ids.extend(sentence_ids)
+                            language_ids.extend(sentence_lids)
+
+                        torch.save(torch.LongTensor(phoneme_ids), phoneme_ids_path)
+                        torch.save(torch.LongTensor(language_ids), language_ids_path)
                         if report_prepare is None:
                             report_prepare = True
                 else:
@@ -464,7 +559,8 @@ class VitsDataModule(L.LightningDataModule):
                     # utt_id|text or utt_id|speaker_id|text
                     text = row[-1]
 
-                cache_id = get_cache_id(row_number, text, speaker_id=speaker_id)
+                language = self._row_language(row)
+                cache_id = self._cache_id(row_number, text, speaker_id, language)
 
                 phoneme_ids_path = self.cache_dir / f"{cache_id}.phonemes.pt"
                 if not phoneme_ids_path:
@@ -493,6 +589,17 @@ class VitsDataModule(L.LightningDataModule):
                     )
                     continue
 
+                language_ids_path: Optional[Path] = None
+                if self.is_multilingual:
+                    language_ids_path = self.cache_dir / f"{cache_id}.langs.pt"
+                    if not language_ids_path.exists():
+                        _LOGGER.warning(
+                            "Missing language ids for %s: %s",
+                            audio_path,
+                            language_ids_path,
+                        )
+                        continue
+
                 text: Optional[str] = None
                 text_path = self.cache_dir / f"{cache_id}.txt"
                 if text_path.exists():
@@ -505,6 +612,7 @@ class VitsDataModule(L.LightningDataModule):
                         audio_spec_path=audio_spec_path,
                         text=text,
                         speaker_id=speaker_id,
+                        language_ids_path=language_ids_path,
                     )
                 )
 
@@ -516,6 +624,38 @@ class VitsDataModule(L.LightningDataModule):
         train_set_size = n - valid_set_size - num_test
         self.train_dataset, self.test_dataset, self.val_dataset = random_split(
             full_dataset, [train_set_size, num_test, valid_set_size]
+        )
+
+    def _row_language(self, row: Sequence[str]) -> Optional[str]:
+        if not self.is_multilingual:
+            return None
+
+        min_columns = 4 if self.is_multispeaker else 3
+        assert (
+            len(row) >= min_columns
+        ), "Expected a language column before the text for multilingual metadata"
+        language = row[-2]
+        if language not in self.languages:
+            raise ValueError(
+                f"Unknown language '{language}': expected one of {self.languages}"
+            )
+
+        return language
+
+    def _cache_id(
+        self,
+        row_number: int,
+        text: str,
+        speaker_id: Optional[int],
+        language: Optional[str],
+    ) -> str:
+        if language is None:
+            return get_cache_id(row_number, text, speaker_id=speaker_id)
+
+        return get_cache_id(
+            row_number,
+            f"{self._languages_cache_key}_{language}_{text}",
+            speaker_id=speaker_id,
         )
 
     def _make_dataloader(
@@ -624,6 +764,7 @@ class UtteranceTensors:
     audio_norm: FloatTensor
     speaker_id: Optional[LongTensor] = None
     text: Optional[str] = None
+    language_ids: Optional[LongTensor] = None
 
     @property
     def spec_length(self) -> int:
@@ -639,6 +780,7 @@ class Batch:
     audios: FloatTensor
     audio_lengths: LongTensor
     speaker_ids: Optional[LongTensor] = None
+    language_ids: Optional[LongTensor] = None
 
 
 class VitsDataset(Dataset):
@@ -658,6 +800,11 @@ class VitsDataset(Dataset):
                 LongTensor([utt.speaker_id]) if utt.speaker_id is not None else None
             ),
             text=utt.text,
+            language_ids=(
+                torch.load(utt.language_ids_path)
+                if utt.language_ids_path is not None
+                else None
+            ),
         )
 
 
@@ -713,6 +860,11 @@ class UtteranceCollate:
         if self.is_multispeaker:
             speaker_ids = LongTensor(num_utterances)
 
+        language_ids: Optional[LongTensor] = None
+        if utterances[0].language_ids is not None:
+            language_ids = LongTensor(num_utterances, max_phonemes_length)
+            language_ids.zero_()
+
         # Sort by decreasing spectrogram length
         sorted_utterances = sorted(
             utterances, key=lambda u: u.spectrogram.size(1), reverse=True
@@ -736,6 +888,11 @@ class UtteranceCollate:
                 assert speaker_ids is not None
                 speaker_ids[utt_idx] = utt.speaker_id
 
+            if language_ids is not None:
+                assert utt.language_ids is not None, "Missing language ids"
+                assert utt.language_ids.size(0) == phoneme_length
+                language_ids[utt_idx, :phoneme_length] = utt.language_ids
+
         return Batch(
             phoneme_ids=phonemes_padded,
             phoneme_lengths=phoneme_lengths,
@@ -744,4 +901,20 @@ class UtteranceCollate:
             audios=audio_padded,
             audio_lengths=audio_lengths,
             speaker_ids=speaker_ids,
+            language_ids=language_ids,
         )
+
+
+def load_lexicon(lexicon_path: Union[str, Path]) -> Dict[str, str]:
+    """Load a foreign word lexicon: word<TAB>espeak voice per line."""
+    lexicon: Dict[str, str] = {}
+    with open(lexicon_path, "r", encoding="utf-8") as lexicon_file:
+        for line in lexicon_file:
+            line = line.strip()
+            if (not line) or line.startswith("#"):
+                continue
+
+            word, language = line.split("\t")[:2]
+            lexicon[normalize_word(word.strip())] = language.strip()
+
+    return lexicon

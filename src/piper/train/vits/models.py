@@ -176,9 +176,11 @@ class TextEncoder(nn.Module):
         n_layers: int,
         kernel_size: int,
         p_dropout: float,
+        n_languages: int = 1,
     ):
         super().__init__()
         self.n_vocab = n_vocab
+        self.n_languages = n_languages
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
         self.filter_channels = filter_channels
@@ -190,13 +192,26 @@ class TextEncoder(nn.Module):
         self.emb = nn.Embedding(n_vocab, hidden_channels)
         nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
 
+        if n_languages > 1:
+            # One language id per phoneme id, so a sentence can switch
+            # languages word by word (code-switching).
+            # Zero init: a voice warmstarted from a monolingual checkpoint
+            # starts exactly where that checkpoint was.
+            self.emb_lang = nn.Embedding(n_languages, hidden_channels)
+            nn.init.zeros_(self.emb_lang.weight)
+
         self.encoder = attentions.Encoder(
             hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout
         )
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-    def forward(self, x, x_lengths):
-        x = self.emb(x) * math.sqrt(self.hidden_channels)  # [b, t, h]
+    def forward(self, x, x_lengths, lid=None):
+        x = self.emb(x)  # [b, t, h]
+        if self.n_languages > 1:
+            assert lid is not None, "Missing language ids"
+            x = x + self.emb_lang(lid)
+
+        x = x * math.sqrt(self.hidden_channels)
         x = torch.transpose(x, 1, -1)  # [b, h, t]
         x_mask = torch.unsqueeze(
             commons.sequence_mask(x_lengths, x.size(2)), 1
@@ -636,6 +651,7 @@ class SynthesizerTrn(nn.Module):
         n_speakers: int = 1,
         gin_channels: int = 0,
         use_sdp: bool = True,
+        n_languages: int = 1,
     ):
 
         super().__init__()
@@ -657,6 +673,7 @@ class SynthesizerTrn(nn.Module):
         self.segment_size = segment_size
         self.n_speakers = n_speakers
         self.gin_channels = gin_channels
+        self.n_languages = n_languages
 
         self.use_sdp = use_sdp
 
@@ -669,6 +686,7 @@ class SynthesizerTrn(nn.Module):
             n_layers,
             kernel_size,
             p_dropout,
+            n_languages=n_languages,
         )
         self.dec = Generator(
             inter_channels,
@@ -705,11 +723,11 @@ class SynthesizerTrn(nn.Module):
         if n_speakers > 1:
             self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-    def forward(self, x, x_lengths, y, y_lengths, sid=None):
+    def forward(self, x, x_lengths, y, y_lengths, sid=None, lid=None):
         # Import here so we can avoid building the module for inference only
         from . import monotonic_align
 
-        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, lid=lid)
         if self.n_speakers > 1:
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
@@ -780,8 +798,9 @@ class SynthesizerTrn(nn.Module):
         length_scale=1,
         noise_scale_w=0.8,
         max_len=None,
+        lid=None,
     ):
-        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, lid=lid)
         if self.n_speakers > 1:
             assert sid is not None, "Missing speaker id"
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]

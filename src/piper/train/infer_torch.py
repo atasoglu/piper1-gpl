@@ -44,6 +44,11 @@ def main() -> None:
     with open(args.config, "r", encoding="utf-8") as config_file:
         config = PiperConfig.from_dict(json.load(config_file))
 
+    if config.language_id_map:
+        parser.error(
+            "Multilingual voices are not supported here; export to ONNX and use PiperVoice"
+        )
+
     sample_rate = config.sample_rate
 
     # Phonemizer is created lazily depending on phoneme type

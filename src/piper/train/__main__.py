@@ -55,6 +55,7 @@ class VitsLightningCLI(LightningCLI):
         parser.link_arguments("model.hop_length", "data.hop_length")
         parser.link_arguments("model.win_length", "data.win_length")
         parser.link_arguments("model.segment_size", "data.segment_size")
+        parser.link_arguments("data.languages", "model.languages")
 
 
 def main():
