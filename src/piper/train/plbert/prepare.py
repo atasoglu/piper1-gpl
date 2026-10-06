@@ -237,6 +237,10 @@ def _process_line(language_text: Tuple[str, str]) -> Optional[Dict[str, Any]]:
     language, text = language_text
     try:
         sample = make_sample(text, language, _PHONEMIZER, **_SETTINGS)
+    except ValueError as err:
+        # Raw corpora contain markup such as <ref>...</ref> that is not a language tag
+        _LOGGER.warning("Skipping line (%s): %s", err, text[:100])
+        return None
     except Exception:  # pylint: disable=broad-exception-caught
         _LOGGER.exception("Failed to process: %s", text)
         return None
