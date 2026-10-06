@@ -29,6 +29,7 @@ from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from piper.const import BOS, EOS, PAD
@@ -167,6 +168,11 @@ def main() -> None:
             if sample is None:
                 continue
 
+            sample = {
+                key: torch.from_numpy(value) if isinstance(value, np.ndarray) else value
+                for key, value in sample.items()
+            }
+
             num_samples += 1
             if bool((sample["word_ids"] >= 0).any()):
                 num_aligned += 1
@@ -230,10 +236,22 @@ def _init_worker(settings: Dict) -> None:
 def _process_line(language_text: Tuple[str, str]) -> Optional[Dict[str, Any]]:
     language, text = language_text
     try:
-        return make_sample(text, language, _PHONEMIZER, **_SETTINGS)
+        sample = make_sample(text, language, _PHONEMIZER, **_SETTINGS)
     except Exception:  # pylint: disable=broad-exception-caught
         _LOGGER.exception("Failed to process: %s", text)
         return None
+
+    if sample is None:
+        return None
+
+    # Tensors would go back to the main process through shared memory, one
+    # file descriptor and mmap each; on a large corpus that exhausts the mmap
+    # limit ("unable to mmap ... Cannot allocate memory"). Numpy arrays are
+    # pickled by value.
+    return {
+        key: value.numpy() if isinstance(value, torch.Tensor) else value
+        for key, value in sample.items()
+    }
 
 
 def make_sample(
