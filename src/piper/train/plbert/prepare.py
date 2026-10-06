@@ -5,7 +5,8 @@ Input: a text file with one sentence (or paragraph) per line, either
 and the lexicon work exactly as they do for a voice.
 
 Output directory:
-- meta.json: languages, phoneme id map, mask id and word vocabulary size
+- meta.json: languages, phoneme id map, mask id, word vocabulary size and
+  sample count; written last, so it exists only after a finished run
 - word_vocab.json: word -> id, the most frequent --vocab-size words
 - shard_*.pt: lists of samples with, per phoneme id, its language id and the
   index of the word it belongs to (-1 for BOS/PAD/EOS, spaces and punctuation),
@@ -136,8 +137,10 @@ def main() -> None:
         "phoneme_id_map": phoneme_id_map,
         "word_vocab_size": len(word_vocab),
     }
-    with open(output_dir / "meta.json", "w", encoding="utf-8") as meta_file:
-        json.dump(meta, meta_file, ensure_ascii=False, indent=2)
+    # meta.json is written last: its "num_samples" marks a finished run
+    (output_dir / "meta.json").unlink(missing_ok=True)
+    for old_shard in output_dir.glob("shard_*.pt*"):
+        old_shard.unlink()
 
     # Pass 2: phonemize in worker processes
     settings = {
@@ -157,7 +160,10 @@ def main() -> None:
     def write_shard() -> None:
         nonlocal num_shards, shard
         shard_path = output_dir / f"shard_{num_shards:05d}.pt"
-        torch.save(shard, shard_path)
+        # Write and rename so an interrupted run leaves no truncated shard
+        tmp_path = shard_path.with_suffix(".pt.tmp")
+        torch.save(shard, tmp_path)
+        tmp_path.replace(shard_path)
         _LOGGER.info("Wrote %s sample(s) to %s", len(shard), shard_path)
         num_shards += 1
         shard = []
@@ -183,6 +189,11 @@ def main() -> None:
 
     if shard:
         write_shard()
+
+    meta["num_samples"] = num_samples
+    meta["num_shards"] = num_shards
+    with open(output_dir / "meta.json", "w", encoding="utf-8") as meta_file:
+        json.dump(meta, meta_file, ensure_ascii=False, indent=2)
 
     _LOGGER.info(
         "Done: %s sample(s) in %s shard(s); %s with word targets",
