@@ -23,9 +23,15 @@ def code(text):
 
 
 md(r"""
-# Piper TR+EN pilot eğitimi (1–2 saat, T4)
+# Piper TR+EN pilot eğitimi (~2 saat, T4)
 
-Amaç: hazır veri setlerinden küçük, dengeli bir karışımla çok dilli (code-switching) bir Piper sesini eğitip **bir gelişme olup olmadığını ölçmek**.
+Amaç: hazır veri setlerinden küçük, dengeli bir karışımla çok dilli (code-switching) ve **PL-BERT ile ön eğitilmiş text encoder'lı** bir Piper sesini eğitip **bir gelişme olup olmadığını ölçmek**.
+
+Model kriterleri (hepsi bu notebook'ta):
+1. **Çok dilli / code-switching:** her fonem kendi dil ID'sini taşır; yabancı kelimeler lexicon ve `<en-us>…</en-us>` ile bulunur.
+2. **PL-BERT:** text encoder (`enc_p`), ses verisi olmadan Türkçe + İngilizce metin üzerinde ön eğitilir (maskeli fonem + dondurulmuş XLM-R kelime vektörleri), ses modeli bu encoder'la başlar.
+3. **MRD** discriminator açık.
+4. **Inference'ta ek parametre/gecikme yok:** ön eğitim başlıkları ve dil modeli export'a girmez.
 
 | Dil | Konuşmacı | Kaynak | Süre |
 |---|---|---|---|
@@ -34,7 +40,7 @@ Amaç: hazır veri setlerinden küçük, dengeli bir karışımla çok dilli (co
 | EN | `en_1116`, `en_696`, `en_6367` | LibriTTS-R train-clean-100 (CC BY 4.0) | ~53 dk |
 
 * Klipler 1.5–15 s, sabit seed. Toplam ~1000 klip, ~2 saat ses.
-* `tr_TR-dfki-medium`'dan warmstart, 30 epoch, **en fazla 1 saat 40 dk** (süre dolarsa eğitim kendiliğinden durur).
+* Akış: kurulum → veri → **PL-BERT ön eğitimi (en fazla 25 dk)** → ses eğitimi (30 epoch, **en fazla 1 sa 30 dk**, `tr_TR-dfki-medium`'dan warmstart + ön eğitimli encoder) → export → ölçüm. Süre dolarsa her aşama kendiliğinden durur.
 * Değerlendirme: 20 code-switching + 10 TR + 10 EN cümle; karşılaştırma tabanı hazır `tr_TR-dfki-medium`. Whisper ile İngilizce kelime isabeti / hata oranları, WavLM ile konuşmacı benzerliği.
 
 > **Hücreleri sırayla çalıştırın.** Ayar yapmanız gerekmez. Son hücre sesleri ve sonuçları zip olarak indirir; çıktıları bana yapıştırın.
@@ -67,7 +73,7 @@ if not Path("/content/piper1-gpl").exists():
 
 !pip install -q uv
 !uv pip install --python {sys.executable} -q scikit-build cmake ninja cython
-!uv pip install --python {sys.executable} -q -e ".[train]"
+!uv pip install --python {sys.executable} -q -e ".[train,plbert]" datasets
 !{sys.executable} setup.py build_ext --inplace > /content/build_ext.log 2>&1 && echo "espeakbridge OK"
 !bash build_monotonic_align.sh && echo "monotonic_align OK"
 
@@ -272,17 +278,109 @@ for r in hits[:5]:
 """)
 
 md(r"""
-## 3. Eğitim (≤ 1 sa 40 dk)
+## 3. PL-BERT: text encoder ön eğitimi (≤ 25 dk)
 
-* `tr_TR-dfki-medium`'dan warmstart; konuşmacı, dil ve MRD katmanları sıfırdan başlar.
-* 30 epoch; öğrenme oranı bu süreye göre azalır. Süre 1 sa 40 dk'yı aşarsa eğitim durur ve son checkpoint kullanılır.
+Encoder yalnızca fonemleri görür, cümle bağlamını bilmez; bu da "okunan" prozodinin bir nedeni. Burada `enc_p`, ses olmadan metin üzerinde ön eğitilir:
+* **Korpus:** Wikipedia (TR + EN, dil başına 40.000 cümle) + pilotun kendi konuşma metinleri (konuşma diline yakın).
+* **Hedef:** maskeli fonem (tüm kelime maskeleme) + `lm`: her fonemin ait olduğu kelimenin, dondurulmuş `xlm-roberta-base` ile üretilmiş bağlamsal vektörü (kosinüs kaybı). Türkçe gibi eklemeli dillerde kelime sözlüğü seyrek kaldığı için `vocab` hedefinden daha iyi olması beklenir; bu henüz ölçülmedi.
+* Dil modeli yalnızca burada çalışır; checkpoint'e ve export'a girmez. Tahmin başlıkları atılır, yalnızca encoder ses modeline yüklenir.
+* Sağlık kontrolü: `val_mlm_acc` artmalı; `val_word` **0'dan büyük** kalmalı (0 ise kelimeler dil modelinin token'larıyla eşleşmiyor demektir).
+""")
+
+code(r"""
+import re
+from datasets import load_dataset
+
+SENTENCES_PER_LANGUAGE = 40_000
+WIKI_CONFIGS = {"tr": "20231101.tr", "en-us": "20231101.en"}
+CORPUS = WORK / "plbert_corpus.txt"
+_sentence_split = re.compile(r"(?<=[.!?])\s+(?=[A-ZÇĞİÖŞÜ])")
+
+if not CORPUS.exists():
+    with open(CORPUS, "w", encoding="utf-8") as out:
+        for language, config in WIKI_CONFIGS.items():
+            n = 0
+            for article in load_dataset("wikimedia/wikipedia", config, split="train", streaming=True):
+                for paragraph in article["text"].split("\n"):
+                    for sentence in _sentence_split.split(paragraph.strip()):
+                        sentence = " ".join(sentence.split())
+                        if 20 <= len(sentence) <= 250 and "|" not in sentence:
+                            out.write(f"{language}|{sentence}\n")
+                            n += 1
+                if n >= SENTENCES_PER_LANGUAGE:
+                    break
+            print(language, n)
+        # Pilotun konuşma metinleri (+ içindeki yabancı kelimeler lexicon'dan işaretlenir)
+        for utt, speaker, language, text in rows:
+            out.write(f"{language}|{text}\n")
+
+PLBERT_DATA = WORK / "plbert_data"
+# prepare meta.json'yi en son yazar; "num_samples" yoksa önceki çalışma yarıda kalmıştır
+_meta = PLBERT_DATA / "meta.json"
+if not _meta.exists() or "num_samples" not in json.loads(_meta.read_text()):
+    !python -m piper.train.plbert.prepare \
+        --corpus {CORPUS} \
+        --output-dir {PLBERT_DATA} \
+        --languages tr en-us \
+        --lexicon {LEXICON} \
+        --num-workers {os.cpu_count()}
+!wc -l {CORPUS}
+!ls {PLBERT_DATA} | head -5
+""")
+
+code(r"""
+PLBERT_RUN = WORK / "plbert_run"
+PLBERT_PRECISION = "bf16-mixed" if TTS_PRECISION == "bf16-mixed" else "16-mixed"
+
+def last_ckpt_in(run_dir):
+    ckpts = sorted(Path(run_dir).glob("lightning_logs/version_*/checkpoints/last.ckpt"), key=lambda p: p.stat().st_mtime)
+    return ckpts[-1] if ckpts else None
+
+resume = last_ckpt_in(PLBERT_RUN)
+resume_arg = f"--ckpt_path {resume}" if resume else ""
+!python -m piper.train.plbert fit \
+    --data.data_dir {PLBERT_DATA} \
+    --data.batch_size 64 \
+    --data.num_workers 2 \
+    --model.word_target lm \
+    --model.lm_name xlm-roberta-base \
+    --model.warmup_steps 200 \
+    --trainer.max_steps 100000 \
+    --trainer.max_time 00:00:25:00 \
+    --trainer.val_check_interval 500 \
+    --trainer.precision {PLBERT_PRECISION} \
+    --trainer.default_root_dir {PLBERT_RUN} \
+    {resume_arg}
+
+TEXT_ENCODER_CKPT = last_ckpt_in(PLBERT_RUN)
+assert TEXT_ENCODER_CKPT, "PL-BERT checkpoint'i yok: ön eğitim hücresi hata verdi"
+print("text encoder:", TEXT_ENCODER_CKPT)
+
+# Sağlık kontrolü
+try:
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    acc = EventAccumulator(str(sorted(PLBERT_RUN.glob("lightning_logs/version_*"))[-1]))
+    acc.Reload()
+    for tag in ("train_mlm_acc", "val_mlm_acc", "val_word"):
+        if tag in acc.Tags()["scalars"]:
+            v = [s.value for s in acc.Scalars(tag)]
+            print(f"{tag:14s} ilk {v[0]:.3f}  son {v[-1]:.3f}  ({len(v)} kayıt)")
+except Exception as err:
+    print("PL-BERT kayıpları okunamadı:", err)
+""")
+
+md(r"""
+## 4. Ses eğitimi (≤ 1 sa 30 dk)
+
+* `tr_TR-dfki-medium`'dan warmstart; konuşmacı, dil ve MRD katmanları sıfırdan başlar. **Sonra** PL-BERT encoder'ı `enc_p`'nin üzerine yüklenir (`--model.text_encoder_ckpt`): ses modelinin geri kalanı dfki'den, text encoder PL-BERT'ten gelir.
+* 30 epoch; öğrenme oranı bu süreye göre azalır. Süre 1 sa 30 dk'yı aşarsa eğitim durur ve son checkpoint kullanılır.
 * Batch 12 (15 s'lik kliplerle T4 belleği için). GPU belleği yetmezse hücre kendiliğinden batch 8 ile devam eder.
 * İlerleme çubuğundaki `it/s` değerine bakın: T4 fp32'de ~0.4–0.5 bekleniyor.
 """)
 
 code(r"""
 MAX_EPOCHS = 30
-MAX_TIME = "00:01:40:00"
+MAX_TIME = "00:01:30:00"
 RUN = WORK / "run"
 CONFIG = RUN / "voice.onnx.json"
 LOG = WORK / "train.log"
@@ -298,8 +396,9 @@ def last_ckpt():
 def train(batch_size):
     resume = last_ckpt()
     # Devam ederken warmstart atlanır
-    start_arg = f"--ckpt_path {resume}" if resume else f"--model.warmstart_ckpt {DFKI_CKPT}"
-    print("batch:", batch_size, "| başlangıç:", resume or "dfki warmstart")
+    start_arg = (f"--ckpt_path {resume}" if resume else
+                 f"--model.warmstart_ckpt {DFKI_CKPT} --model.text_encoder_ckpt {TEXT_ENCODER_CKPT}")
+    print("batch:", batch_size, "| başlangıç:", resume or "dfki warmstart + PL-BERT encoder")
     !python -m piper.train fit \
         --data.voice_name pilot \
         --data.csv_path {CSV_PATH} \
@@ -332,7 +431,7 @@ print("son checkpoint:", last_ckpt())
 """)
 
 md(r"""
-## 4. Export ve sentez
+## 5. Export ve sentez
 
 Pilot ses: `antalia` (hedef), `ali` (diğer TR konuşmacı) ve `en_1116` (EN konuşmacı) ile; taban: hazır `tr_TR-dfki-medium` (tek dilli, yabancı kelimeleri Türkçe kurallarla okur).
 """)
@@ -398,7 +497,7 @@ for c in CLIPS:
 """)
 
 md(r"""
-## 5. Ölçüm ve sonuçlar
+## 6. Ölçüm ve sonuçlar
 
 * **Whisper (large-v3-turbo):** code-switching ve TR cümleleri Türkçe, EN cümleleri İngilizce modda yazıya dökülür.
   * `cs_en_hit`: code-switching cümlelerindeki İngilizce kelimenin transkriptte geçme oranı (yüksek = İngilizce okunmuş).
@@ -488,7 +587,7 @@ for i, (text, words) in enumerate(EVAL_CS):
 df.drop(columns=["path"]).to_csv(WORK / "results.csv", index=False)
 table.to_csv(WORK / "summary.csv")
 
-!cd {WORK} && rm -f pilot_results.zip && zip -qr pilot_results.zip samples results.csv summary.csv train.log run/voice.onnx.json
+!cd {WORK} && rm -f pilot_results.zip && zip -qr pilot_results.zip samples results.csv summary.csv train.log run/voice.onnx.json plbert_run/lightning_logs
 from google.colab import files
 files.download(str(WORK / "pilot_results.zip"))
 """)
@@ -496,6 +595,7 @@ files.download(str(WORK / "pilot_results.zip"))
 md(r"""
 ## Notlar
 
+* **PL-BERT'in faydası bu turda izole ölçülmüyor:** karşılaştırma tabanı tek dilli dfki'dir. PL-BERT'li / PL-BERT'siz A/B, pilot yön gösterirse büyük koşuda yapılır.
 * **Bu turda ne ölçülüyor:** (1) Antalia sesi İngilizce kelimeleri dfki'den daha İngilizce okuyor mu (`cs_en_hit`), (2) TR kalitesi korunuyor mu (`tr_cer`), (3) tını dil değişince Antalia'ya yakın kalıyor mu (`sim_*`).
 * **Sınırlar:** Antalia'nın ≤15 s kliplerinde yabancı kelime çok az (yalnızca "Bluetooth", "spam"); gerçek code-switching sinyali neredeyse yok. `zeynep`/`ali` 16 kHz sentetik ses. 1–2 saatlik eğitim kalite tavanını değil, yönü gösterir.
 * Checkpoint'ler `/content/pilot/run` altında; oturum kapanınca silinir. Saklamak isterseniz `run/lightning_logs/.../checkpoints/last.ckpt` ve `run/pilot.onnx` dosyalarını sol panelden indirin.
